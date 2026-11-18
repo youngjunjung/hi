@@ -1,0 +1,153 @@
+# 개인 AI 에이전트 스택 (안 C: Open WebUI + LiteLLM + MCP(mcpo) + n8n)
+#
+# 모든 포트는 127.0.0.1에만 바인딩합니다. 폰/태블릿에서는 Tailscale(`tailscale serve`)로만 접근하세요.
+#   - Open WebUI : 127.0.0.1:3000  → https://<서버>.<tailnet>.ts.net
+#   - n8n        : 127.0.0.1:5678  → https://<서버>.<tailnet>.ts.net:8443
+#   - LiteLLM UI : 127.0.0.1:4000  → (관리용, 필요할 때만 SSH 터널로 접근)
+#
+# 이미지 버전은 고정해 두었습니다. 업그레이드는 docs/operations.md 참고.
+
+name: agent
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # ── 저장소: Postgres + pgvector (LiteLLM, n8n, Open WebUI가 각자 DB를 씀) ──
+  postgres:
+    <<: *common
+    image: pgvector/pgvector:0.8.7-pg17-trixie
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── LLM 게이트웨이: 모델 라우팅, 키 관리, 비용 추적 ──
+  litellm:
+    <<: *common
+    image: ghcr.io/berriai/litellm:v1.108.11-lts
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      STORE_MODEL_IN_DB: "False"
+      UI_USERNAME: admin
+      UI_PASSWORD: ${LITELLM_UI_PASSWORD}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    ports:
+      - "127.0.0.1:4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── MCP 브리지: stdio MCP 서버들을 OpenAPI 도구 서버로 노출 ──
+  mcpo:
+    <<: *common
+    # mcpo는 버전 태그를 배포하지 않아 digest로 고정 (mcpo 0.0.20)
+    image: ghcr.io/open-webui/mcpo@sha256:1e82c9555c19e50b80745705f32b47a2647589f35279527b5118ecd3a71bd467
+    command: ["--config", "/config/config.json", "--port", "8000", "--api-key", "${MCPO_API_KEY}", "--hot-reload"]
+    env_file:
+      - path: ./mcpo/secrets.env
+        required: false
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ./mcpo:/config:ro
+      - ${AGENT_FILES_DIR:-./data/files}:/data/files
+      - mcpo-cache:/root/.cache
+      - mcpo-npm:/root/.npm
+
+  # ── 대화 UI (폰/태블릿 PWA) ──
+  open-webui:
+    <<: *common
+    image: ghcr.io/open-webui/open-webui:v0.13.3
+    environment:
+      WEBUI_URL: ${WEBUI_URL}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/openwebui
+      VECTOR_DB: pgvector
+      PGVECTOR_DB_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/openwebui
+      ENABLE_OLLAMA_API: "false"
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
+      DEFAULT_USER_ROLE: pending
+      TZ: ${TZ}
+      # 첫 부팅 때만 적용됨(이후엔 관리자 설정 화면에서 수정). mcpo의 각 서버를 도구로 등록.
+      TOOL_SERVER_CONNECTIONS: >-
+        [
+          {"type":"openapi","url":"http://mcpo:8000/time","path":"openapi.json","auth_type":"bearer","key":"${MCPO_API_KEY}","config":{"enable":true},"info":{"id":"time","name":"Time","description":"현재 시각, 시간대 변환"}},
+          {"type":"openapi","url":"http://mcpo:8000/fetch","path":"openapi.json","auth_type":"bearer","key":"${MCPO_API_KEY}","config":{"enable":true},"info":{"id":"fetch","name":"Web Fetch","description":"웹페이지 내용 가져오기"}},
+          {"type":"openapi","url":"http://mcpo:8000/files","path":"openapi.json","auth_type":"bearer","key":"${MCPO_API_KEY}","config":{"enable":true},"info":{"id":"files","name":"Files","description":"서버의 작업 폴더 읽기/쓰기"}}
+        ]
+    volumes:
+      - open-webui-data:/app/backend/data
+    ports:
+      - "127.0.0.1:3000:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+
+  # ── 워크플로/자동화: 정기 작업, 알림, 승인 흐름, 복잡한 다단계 작업 ──
+  n8n:
+    <<: *common
+    image: n8nio/n8n:2.48.4
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: ${N8N_HOST}
+      N8N_PROTOCOL: https
+      N8N_EDITOR_BASE_URL: ${N8N_URL}
+      WEBHOOK_URL: ${N8N_URL}
+      N8N_PROXY_HOPS: "1"
+      # IPv6가 꺼진 서버에서도 기동되도록 IPv4로 리슨
+      N8N_LISTEN_ADDRESS: 0.0.0.0
+      GENERIC_TIMEZONE: ${TZ}
+      TZ: ${TZ}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "336"
+    volumes:
+      - n8n-data:/home/node/.n8n
+    ports:
+      - "127.0.0.1:5678:5678"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  open-webui-data:
+  n8n-data:
+  mcpo-cache:
+  mcpo-npm:

@@ -1,0 +1,5 @@
+stack/.env
+stack/mcpo/secrets.env
+stack/data/
+stack/backups/
+stack/docker-compose.override.yml
